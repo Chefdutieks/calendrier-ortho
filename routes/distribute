@@ -1,0 +1,44 @@
+const express = require("express");
+const router = express.Router();
+const { distributeMotifs } = require("../utils/distribution");
+const { getMissingSlots } = require("../delta-tracker");
+const { buildCalendarMap, fetchMotivesBetween ,fetchCalendocSlotsWithMotifs} = require("../utils/fetchCalendocHistory");
+const { logMotifSummaryPerMonth } = require("../utils/stats");
+
+
+router.post("/", async (req, res) => {
+  console.log("📥 Requête reçue sur /distribute");
+  try {
+    const ratios = { BSC: 0.6, SNC: 0.2, UNL: 0.2 };
+    const dryRun = req.query.dryRun === "true";
+    console.log("🔧 dryRun mode:", dryRun);
+
+    const missing = await getMissingSlots();
+    console.log("📋 Créneaux manquants :", missing.length);
+
+    const calendarMap = await buildCalendarMap();
+    const calendarIds = calendarMap.ALL; // ✅ ici tu extrais les IDs globaux
+
+    const result = await distributeMotifs(
+      missing,
+      async () => (await buildCalendarMap()).ALL,
+      ratios,
+      dryRun
+    );
+    console.log("✅ Motifs distribués :", result.length);
+
+    // Récupère aussi les slots Calendoc ouverts
+    const allSlots = result.concat(
+      await fetchCalendocSlotsWithMotifs(new Date(2025, 5, 1), new Date(2025, 7, 1), calendarIds)
+    );
+
+    logMotifSummaryPerMonth(allSlots);
+
+    res.json({ success: true, message: "Distribute POST OK" });
+  } catch (err) {
+    console.error("❌ Erreur distribution :", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+module.exports = router;

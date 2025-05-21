@@ -1,0 +1,119 @@
+const fs = require("fs");
+const path = require("path");
+const { getWeekKey, groupByWeek, getPrevious4WeeksRange } = require("./time");
+const { fetchMotivesBetween  } = require("../utils/fetchCalendocHistory");
+
+
+const logFile = path.join(__dirname, "../logs/distribution.log");
+function appendLog(message) {
+  fs.appendFileSync(logFile, message + "\n");
+}
+
+function parseSlotDatetime(slot) {
+  const [day, month, year] = slot.date.split("/").map(Number);
+  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T${slot.time}:00`);
+}
+
+function getSlotMeta(slot) {
+  const [hour, minute] = slot.time.split(":").map(Number);
+  const date = parseSlotDatetime(slot);
+  const jourIndex = date.getDay();
+  const jours = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];
+  const jour = jours[jourIndex];
+  const plage = hour < 12 || (hour === 12 && minute <= 30) ? "matin" : "apresmidi";
+  return { jour, plage };
+}
+
+function countMotifsDetailed(slots) {
+  const motifs = { BSC: init(), SNC: init(), UNL: init() };
+
+  for (const slot of slots) {
+    const m = slot.assignedMotive;
+    if (!motifs[m]) continue;
+
+    const { jour, plage } = getSlotMeta(slot);
+    motifs[m].total += 1;
+    motifs[m].parJour[jour] += 1;
+    motifs[m].parPlage[plage] += 1;
+  }
+
+  return motifs;
+
+  function init() {
+    return {
+      total: 0,
+      parJour: {
+        lundi: 0, mardi: 0, mercredi: 0, jeudi: 0, vendredi: 0, samedi: 0, dimanche: 0
+      },
+      parPlage: {
+        matin: 0,
+        apresmidi: 0
+      }
+    };
+  }
+}
+
+function chooseBestMotiveDetailed(stats, targetRatios, slotMeta) {
+  const { jour, plage } = slotMeta;
+  const total = Object.values(stats).reduce((sum, m) => sum + m.total, 0) || 1;
+
+  const candidats = Object.entries(stats).map(([motive, data]) => {
+    const globalRatio = data.total / total;
+    const globalDeficit = targetRatios[motive] - globalRatio;
+    const jourCount = data.parJour[jour] || 0;
+    const plageCount = data.parPlage[plage] || 0;
+
+    return {
+      motive,
+      score: globalDeficit - 0.01 * jourCount - 0.01 * plageCount
+    };
+  });
+
+  candidats.sort((a, b) => b.score - a.score);
+  return candidats[0].motive;
+}
+
+async function distributeMotifs(slots, fetchCalendarIds, targetRatios, dryRun = false) {
+  const calendarIds = await fetchCalendarIds();
+
+  const filtered = slots.filter(slot => {
+    const dateObj = parseSlotDatetime(slot);
+    return dateObj.getDay() !== 0; // 0 = dimanche
+  });
+
+  const weeks = groupByWeek(filtered);
+  const final = [];
+
+  for (const [weekKey, weekSlots] of Object.entries(weeks)) {
+    const weekStart = new Date(weekKey);
+    const { start, end } = getPrevious4WeeksRange(weekStart);
+
+    // Récupère motifs historiques + ouverts sur la semaine
+    const historyMotives = await fetchMotivesBetween(start, new Date(weekStart.getTime() + 7 * 24 * 3600 * 1000), calendarIds);
+    const memory = historyMotives.map(m => ({ assignedMotive: m, date: "", time: "00:00", email: "" }));
+
+    const motifStats = countMotifsDetailed(memory);
+    const sorted = [...weekSlots].sort((a, b) => parseSlotDatetime(a) - parseSlotDatetime(b));
+
+    for (const slot of sorted) {
+      const meta = getSlotMeta(slot);
+      const chosen = chooseBestMotiveDetailed(motifStats, targetRatios, meta);
+
+      motifStats[chosen].total++;
+      motifStats[chosen].parJour[meta.jour]++;
+      motifStats[chosen].parPlage[meta.plage]++;
+
+      final.push({ ...slot, assignedMotive: chosen });
+
+      const logLine = `[${slot.date} ${slot.time}] ${slot.email} → ${chosen} (jour=${meta.jour}, plage=${meta.plage}, BSC=${motifStats.BSC.total}, SNC=${motifStats.SNC.total}, UNL=${motifStats.UNL.total})`;
+
+      console.log(dryRun ? "🔍" : "✅", logLine);
+      if (dryRun) appendLog(logLine);      
+
+    }
+  }
+
+  return final;
+}
+
+module.exports = { distributeMotifs,parseSlotDatetime };

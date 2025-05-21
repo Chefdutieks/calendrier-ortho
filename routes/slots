@@ -1,0 +1,485 @@
+const express = require("express");
+const router = express.Router();
+const db = require("../firestore");
+const { sendCancellationAlert } = require("./mailer");
+
+const START_TIME = 9;
+const END_TIME = 18;
+const SLOT_DURATION = 0.5;
+const DAYS_PER_WEEK = 6;
+const MAX_BOOKINGS = 6;
+const MIN_BOOKING_DAYS_AHEAD = 6;
+const TIMEZONE = "Europe/Paris";
+const { DateTime } = require("luxon");
+
+function formatDateKey(dateObj) {
+  return DateTime.fromJSDate(dateObj, { zone: TIMEZONE })
+    .toFormat("dd/MM/yyyy HH:mm");
+}
+
+/* ------------------------------------------------------------------ *
+ * 1.  LOAD THE ADMIN ADDRESS ONCE AND CACHE IT                       *
+ * ------------------------------------------------------------------ */
+
+/** Document that stores the admin e-mail:  params / mail-users   */
+const ADMIN_DOC = db.doc("params/mail-users");
+
+/** Cache so we hit Firestore only once (unless the process restarts) */
+let ADMIN_EMAIL = null;
+
+/** Async getter with in-memory cache */
+async function getAdminEmail() {
+  if (ADMIN_EMAIL) return ADMIN_EMAIL;                    // served from RAM
+  const snap = await ADMIN_DOC.get();
+  ADMIN_EMAIL = (snap.data()?.email || "").toLowerCase(); // fallback = ""
+  console.log(`🔑 Loaded admin e-mail → ${ADMIN_EMAIL}`);
+  return ADMIN_EMAIL;
+}
+
+/** Convenience predicate */
+async function isAdminEmail(email) {
+  return email && email.toLowerCase() === await getAdminEmail();
+}
+
+/* ------------------------------------------------------------------ *
+ * 2.  AUTH / AUTHORISATION ENDPOINT                                  *
+ * ------------------------------------------------------------------ */
+
+/**
+ * POST /slots/auth/check
+ * { email }  →  { ok: boolean, isAdmin: boolean }
+ */
+router.post("/auth/check", async (req, res) => {
+  try {
+    const email = req.body.email?.toLowerCase();
+    if (!email) return res.status(400).json({ ok:false, message:"Email manquant." });
+
+    const adminEmail = await getAdminEmail();
+    const isAdmin = email === adminEmail;
+
+    // Authorised users are: admin OR present in params/mail-users/ortho
+    const allowedSnap = await db
+      .collection("params/mail-users/ortho")
+      .where("email", "==", email)
+      .limit(1)
+      .get();
+
+    const ok = isAdmin || !allowedSnap.empty;
+    res.json({ ok, isAdmin });
+  } catch (err) {
+    console.error("❌ /auth/check:", err);
+    res.status(500).json({ ok:false, message:"Erreur serveur." });
+  }
+});
+
+
+
+
+router.get("/", async (req, res) => {
+  console.log("🔍 GET /slots", req.query);
+  try {
+    const { weekOffset = 0 } = req.query;
+    const userEmail  = req.query.userEmail?.toLowerCase() || "";
+    const isAdmin    = await isAdminEmail(userEmail);
+
+    const snapshot = await db.collection("bookings-ortho").get();
+    const bookedSlots = new Map();
+    const userBookings = [];
+
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.event !== "Confirmed") return;
+      const dt = new Date(data.dateTime.toDate());
+      const key = formatDateKey(dt);
+      bookedSlots.set(key, (bookedSlots.get(key) || 0) + 1);
+
+      if (isAdmin || data.email?.toLowerCase() === userEmail) {
+        userBookings.push({
+          id: doc.id,
+          key,
+          date: data.date,
+          time: data.time,
+          email: data.email?.toLowerCase() // normalisation forcée
+        });
+      }
+    });
+
+    // Récupération des réservations ophta
+    const ophtaSnapshot = await db.collection("bookings").get();
+    const ophtaBookings = [];
+    ophtaSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.event !== "Confirmed") return;
+      const dt = new Date(data.dateTime.toDate());
+      const key = formatDateKey(dt);
+      ophtaBookings.push(key);
+    });
+
+    // Calcul de la semaine à afficher
+    const today = new Date();
+    const currentDay = today.getDay();
+    const offsetToMonday = currentDay === 0 ? -6 : 1 - currentDay;
+    const startOfWeek = new Date(today);
+    startOfWeek.setDate(today.getDate() + offsetToMonday + (parseInt(weekOffset) * 7));
+
+    const dates = [];
+    const tempDate = new Date(startOfWeek);
+    while (dates.length < DAYS_PER_WEEK) {
+      if (tempDate.getDay() !== 0) {
+        dates.push(new Date(tempDate));
+      }
+      tempDate.setDate(tempDate.getDate() + 1);
+    }
+
+    // Création des slots
+    let slots = [];
+    let dynamicStartTime = START_TIME; // Initialize with the default start time
+    let dynamicMaxBookings = MAX_BOOKINGS;
+
+    for (let h = START_TIME; h < END_TIME; h += SLOT_DURATION) {
+      if (h >= 12 && h < 14.5) continue; // Pause déjeuner
+
+      const hour = Math.floor(h);
+      const minutes = (h % 1) * 60;
+      const row = {
+        time: `${hour.toString().padStart(2, '0')}:${minutes === 0 ? "00" : minutes}`,
+        slots: [],
+        userSlots: []
+      };
+
+      for (let d of dates) {
+        const slotDate = new Date(d);
+        const slotMonth = slotDate.getMonth() + 1; // Month is 0-indexed
+
+          // Adjust max bookings based on month
+          if (slotMonth >= 6) { // June onwards
+            dynamicMaxBookings = 5;
+        } else {
+            dynamicMaxBookings = MAX_BOOKINGS; // Default value
+        }
+
+        // Adjust start time based on month
+        if (slotMonth >= 6) { // June onwards
+            dynamicStartTime = 9.5; 
+        } else {
+            dynamicStartTime = START_TIME; // 9:00 AM
+        }
+
+        // Skip the slot if it's before the dynamic start time
+        if (h < dynamicStartTime) {
+            row.slots.push(null);
+            row.userSlots.push(false);
+            continue;
+        }
+
+        // Mark the first slot as full in May
+        if (slotMonth === 5 && h === START_TIME) {
+            row.slots.push(dynamicMaxBookings); // Mark as full
+            row.userSlots.push(false);
+            continue;
+        }
+
+        // Exemple de désactivation d'un créneau (ici lundi matin)
+        if (slotDate.getDay() === 1 && h < 14) {
+          row.slots.push(null);
+          row.userSlots.push(false);
+          continue;
+        }
+
+        const slotTime = DateTime.fromJSDate(d, { zone: TIMEZONE })
+          .set({ hour, minute: minutes, second: 0, millisecond: 0 });
+        const key = slotTime.toFormat("dd/MM/yyyy HH:mm");
+
+        row.slots.push(bookedSlots.get(key) || 0);
+        row.userSlots.push(userBookings.some(b => b.key === key));
+      }
+
+      slots.push(row);
+    }
+
+    res.json({
+      dates: dates.map(d => d.toLocaleDateString("fr-FR")),
+      slots,
+      user: userEmail,
+      userBookings,
+      ophtaBookings, // Transmission des données de booking ophta
+      isAdmin,
+      maxBookings: MAX_BOOKINGS
+    });
+  } catch (err) {
+    console.error("❌ Erreur dans /slots:", err);
+    res.status(500).json({ error: true, message: "Erreur serveur dans /slots" });
+  }
+});
+
+router.post("/book", async (req, res) => {
+  try {
+    let { date, time, userEmail } = req.body;
+    userEmail = (userEmail || "").toLowerCase();
+    const isAdmin = await isAdminEmail(userEmail);
+
+    const { Timestamp } = require("firebase-admin/firestore");
+    const { DateTime } = require("luxon");
+
+    const dateObj = DateTime.fromFormat(`${date} ${time}`, "dd/MM/yyyy HH:mm", {
+      zone: "Europe/Paris"
+    }).toJSDate();
+
+    if (isNaN(dateObj.getTime())) {
+      console.error("⛔ Date invalide :", date, time);
+      return res.status(400).json({ success: false, message: "Date invalide." });
+    }
+    
+    // **NEW: Check if the booking date is within XX days**
+    const today = DateTime.now().setZone("Europe/Paris").startOf('day');
+    const bookingDate = DateTime.fromJSDate(dateObj, { zone: "Europe/Paris" }).startOf('day');
+    const diffInDays = bookingDate.diff(today, 'days').days;
+    
+
+    if (!isAdmin && diffInDays <= MIN_BOOKING_DAYS_AHEAD) {
+      return res.status(400).json({ success: false, message: `Vous ne pouvez pas réserver un créneau dans les ${MIN_BOOKING_DAYS_AHEAD} prochains jours.` });
+    }
+
+
+    const dateTime = Timestamp.fromDate(dateObj);
+
+    if (!isAdmin) {
+      const bookingDate = DateTime.fromJSDate(dateObj, { zone: "Europe/Paris" });
+      const weekStart = bookingDate.startOf("week");
+      const weekEnd = bookingDate.endOf("week");
+      const weekStartTimestamp = Timestamp.fromDate(weekStart.toJSDate());
+      const weekEndTimestamp = Timestamp.fromDate(weekEnd.toJSDate());
+
+      const weeklySnapshot = await db.collection("bookings-ortho")
+        .where("email", "==", userEmail)
+        .where("event", "==", "Confirmed")
+        .where("dateTime", ">=", weekStartTimestamp)
+        .where("dateTime", "<=", weekEndTimestamp)
+        .get();
+
+      if (weeklySnapshot.size >= 40) {
+        return res.status(400).json({ success: false, message: "Vous avez atteint la limite de 40 créneaux par semaine." });
+      }
+    }
+
+    // Vérifie doublons ou saturation pour le créneau spécifique.
+    const snapshot = await db
+      .collection("bookings-ortho")
+      .where("dateTime", "==", dateTime)
+      .get();
+
+    let bookedCount = 0;
+    let userAlreadyBooked = false;
+
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.event !== "Confirmed") return;
+      bookedCount++;
+      if (data.email.toLowerCase() === userEmail) userAlreadyBooked = true;
+    });
+
+    if (bookedCount >= MAX_BOOKINGS)
+      return res.status(400).json({ success: false, message: "Ce créneau est complet." });
+
+    if (userAlreadyBooked)
+      return res.status(400).json({ success: false, message: "Vous avez déjà réservé ce créneau." });
+
+    await db.collection("bookings-ortho").add({
+      date,
+      time,
+      email: userEmail,
+      dateTime,
+      event: "Confirmed",
+      lastModified: new Date()
+    });
+
+    res.json({ success: true, message: "Réservation confirmée." });
+  } catch (err) {
+    console.error("❌ Erreur dans /slots/book:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur lors de la réservation." });
+  }
+});
+
+router.post("/cancel", async (req, res) => {
+  let { selectedIds, userEmail } = req.body;
+  userEmail = (userEmail || "").toLowerCase();
+  const isAdmin = await isAdminEmail(userEmail);
+  console.log("📩 Payload reçu pour /cancel:", selectedIds);
+
+  try {
+    const snapshot = await db.collection("bookings-ortho").get();
+    const updates = [];
+    snapshot.forEach(doc => {
+      if (selectedIds.includes(doc.id)) {
+        updates.push(doc.ref.update({
+          event: "Cancelled",
+          lastModified: new Date()
+        }));
+      }
+    });
+
+    await Promise.all(updates);
+    const message = `${updates.length} réservation(s) annulée(s).`;
+
+    // send alert only to normal users
+    if (!isAdmin) await sendCancellationAlert(userEmail, selectedIds);
+    res.json({ success:true, message:`${selectedIds.length} réservation(s) annulée(s).` });
+
+  } catch (err) {
+    console.error("❌ Erreur dans /slots/cancel:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur lors de l'annulation." });
+  }
+});
+
+// Middleware to check if the user is an admin
+async function requireAdmin(req, res, next) {
+  const userEmail = req.body.userEmail || req.query.userEmail; // Check both body and query for userEmail
+  console.log("requireAdmin: userEmail =", userEmail); // Add this
+  if (!userEmail) {
+    return res.status(401).json({ success: false, message: "Email manquant." });
+  }
+  const isAdmin = await isAdminEmail(userEmail);
+  console.log("requireAdmin: isAdmin =", isAdmin); // Add this
+  if (!isAdmin) {
+    return res.status(403).json({ success: false, message: "Accès refusé. Seul l'administrateur peut effectuer cette action." });
+  }
+  next();
+}
+
+
+// Ajout d'un email dans la collection
+router.post("/add-mail-user",requireAdmin, async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ success: false, message: "Email requis." });
+  }
+  try {
+    await db.collection("params/mail-users/ortho").add({
+      email: email.toLowerCase(),
+      addedAt: new Date()
+    });
+    res.json({ success: true, message: "Email ajouté avec succès." });
+  } catch (err) {
+    console.error("Erreur lors de l'ajout de l'email:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur." });
+  }
+});
+
+// Récupération de la liste des mails
+router.get("/mail-users",requireAdmin, async (req, res) => {
+  try {
+    const snapshot = await db.collection("params/mail-users/ortho").get();
+    const mails = [];
+    snapshot.forEach(doc => {
+      mails.push({ id: doc.id, ...doc.data() });
+    });
+    res.json(mails);
+  } catch (err) {
+    console.error("Erreur lors de la récupération des mails:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur." });
+  }
+});
+
+// Suppression d'un email de la collection
+router.post("/delete-mail-user",requireAdmin, async (req, res) => {
+  const { id } = req.body;
+  if (!id) {
+    return res.status(400).json({ success: false, message: "Identifiant requis." });
+  }
+  try {
+    await db.collection("params/mail-users/ortho").doc(id).delete();
+    res.json({ success: true, message: "Email supprimé avec succès." });
+  } catch (err) {
+    console.error("Erreur lors de la suppression de l'email:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur." });
+  }
+});
+
+
+router.post("/add-slot",requireAdmin, async (req, res) => {
+  try {
+    let { date, time, mail } = req.body;
+    mail = (mail || "").toLowerCase();
+
+    // Basic validation
+    if (!date || !time || !mail) {
+      return res.status(400).json({ success: false, message: "Date, heure et email sont requis." });
+    }
+
+    const { Timestamp } = require("firebase-admin/firestore");
+    const { DateTime } = require("luxon");
+
+    const dateObj = DateTime.fromFormat(`${date} ${time}`, "dd/MM/yyyy HH:mm", {
+      zone: "Europe/Paris"
+    }).toJSDate();
+
+    if (isNaN(dateObj.getTime())) {
+      console.error("⛔ Date invalide :", date, time);
+      return res.status(400).json({ success: false, message: "Date invalide." });
+    }
+
+    const dateTime = Timestamp.fromDate(dateObj);
+
+    // Check for existing booking at the same time
+    const snapshot = await db
+      .collection("bookings-ortho")
+      .where("dateTime", "==", dateTime)
+      .get();
+
+    let bookedCount = 0;
+    let userAlreadyBooked = false;
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.event === "Confirmed") bookedCount++;
+      if (data.email.toLowerCase() === mail) {
+        if (data.event === "Confirmed") {
+          userAlreadyBooked = true;
+        }
+      }
+    });
+
+    if (userAlreadyBooked)
+      return res.status(400).json({ success: false, message: "L'utilisateur a déjà réservé ce créneau." 
+    });
+
+    // Add the new booking
+    await db.collection("bookings-ortho").add({
+      date,
+      time,
+      email: mail,
+      dateTime,
+      event: "Confirmed",
+      lastModified: new Date()
+    });
+
+    res.json({ success: true, message: "Créneau ajouté avec succès." });
+  } catch (err) {
+    console.error("❌ Erreur dans /slots/add-slot:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur lors de l'ajout du créneau." });
+  }
+});
+
+
+router.get("/search-users",requireAdmin, async (req, res) => {
+  try {
+    const { query } = req.query;
+    if (!query) {
+      return res.json([]); // Return empty array if no query
+    }
+
+    const snapshot = await db
+      .collection("params/mail-users/ortho")
+      .where("email", ">=", query.toLowerCase())
+      .where("email", "<=", query.toLowerCase() + "\uf8ff") // Firestore range query for prefix matching
+      .limit(10) // Limit to 10 results
+      .get();
+
+    const emails = snapshot.docs.map(doc => doc.data().email);
+    res.json(emails);
+  } catch (err) {
+    console.error("❌ Erreur dans /slots/search-users:", err);
+    res.status(500).json({ success: false, message: "Erreur serveur lors de la recherche d'utilisateurs." });
+  }
+});
+
+module.exports = router;

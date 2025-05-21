@@ -1,0 +1,112 @@
+const nodemailer = require("nodemailer");
+const fs = require("fs");
+const path = require("path");
+const db = require("../firestore");
+
+
+require("dotenv").config();
+
+const EMAIL_TO = "csm.to@tessan.io";
+const LOG_FILE = path.join(__dirname, "..", "logs", "email-log.txt");
+
+// Création du transporteur SMTP (Gmail ou autre service)
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: "loudo.sutton@tessan.io",
+    pass: process.env.SMTP_PASSWORD,
+  },
+});
+
+/**
+ * Vérifie si un utilisateur a déjà envoyé trop d'emails récemment (limité à 10/h).
+ */
+function checkRateLimit(userEmail) {
+  try {
+    const now = Date.now();
+    const logData = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, "utf-8") : "";
+    const logs = logData
+      .split("\n")
+      .filter(Boolean)
+      .map(line => JSON.parse(line))
+      .filter(entry => entry.email === userEmail && now - entry.timestamp < 3600 * 1000); // 1h
+
+    return logs.length < 10;
+  } catch (err) {
+    console.error("Erreur lecture des logs :", err);
+    return true;
+  }
+}
+
+/**
+ * Enregistre un envoi d'email dans les logs
+ */
+function logEmail(userEmail, cancelledIds) {
+  try {
+    const entry = {
+      email: userEmail,
+      timestamp: Date.now(),
+      cancelled: cancelledIds,
+    };
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    console.error("Erreur lors du logging email :", err);
+  }
+}
+
+/**
+ * Envoie un mail à Loudo quand un utilisateur (non admin) annule des créneaux
+ */
+async function sendCancellationAlert(userEmail, cancelledIds) {
+  if (!checkRateLimit(userEmail)) {
+    console.warn(`📛 Email NON envoyé — ${userEmail} a dépassé la limite`);
+    return;
+  }
+
+  const bookings = [];
+
+  for (const id of cancelledIds) {
+    try {
+      const doc = await db.collection("bookings-ortho").doc(id).get();
+      if (doc.exists) {
+        const data = doc.data();
+        bookings.push(`${data.date} à ${data.time} (${data.email})`);
+      } else {
+        bookings.push(`Créneau introuvable (ID: ${id})`);
+      }
+    } catch (err) {
+      bookings.push(`Erreur sur ID ${id} : ${err.message}`);
+    }
+  }
+
+  const htmlBody = `
+    <div style="font-family: sans-serif; font-size: 15px;">
+      <p><strong>Utilisateur :</strong> ${userEmail}</p>
+      <p><strong>Créneaux annulés :</strong></p>
+      <ul>
+        ${bookings.map(c => `<li>${c}</li>`).join("")}
+      </ul>
+      <p style="font-size: 13px; color: #888;">Notification automatique DoctoLoudo</p>
+    </div>
+  `;
+
+  const mailOptions = {
+    from: '"DoctoLoudo" <no-reply@tessan.io>',
+    to: EMAIL_TO,
+    subject: "❗ Annulation de créneau par un utilisateur ortho",
+    html: htmlBody,
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log("📧 Email d'annulation envoyé avec succès !");
+  } catch (err) {
+    console.error("❌ Erreur envoi mail :", err);
+  }
+
+  logEmail(userEmail, cancelledIds) 
+
+}
+
+module.exports = { sendCancellationAlert };
