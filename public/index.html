@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Calendrier Orthoptiste</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; }
+    table { width: 80%; margin: 20px auto; border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 10px; text-align: center; }
+    th { background: #f4f4f4; }
+    .available { background-color: #F8F8F8; cursor: pointer; }
+    .full { background-color: #FFB6B6; color: black; }
+    .user-booked { background-color: #B6E5B6 !important; color: black !important; }
+    .nav { cursor: pointer; font-size: 14px; margin: 10px 40px; }
+    .form-container { margin-bottom: 20px; }
+    input, button { padding: 8px; margin: 5px; }
+    .disabled-slot {
+      background-color: #E0E0E0;
+      color: #888;
+      pointer-events: none;
+    }
+    .half { background-color: #FFF2B2; } /* jaune clair */
+    .fullad { background-color: #B6E5B6; } /* vert clair */
+    .availablead { background-color: #F8F8F8; }
+    #userInfo {
+      position: absolute;
+      top: 10px;
+      left: 20px;
+      background: #f8f8f8;
+      padding: 10px;
+      border-radius: 5px;
+      box-shadow: 0px 0px 5px rgba(0, 0, 0, 0.2);
+      font-size: 14px;
+      text-align: left;
+      display: none;
+    }
+    #reserveButton { display: none; }
+    /* Masque le conteneur des boutons si aucun email n'est entré */
+    #userControls { display: none; }
+    #cancelSidebar,
+    #mailSidebar {
+      position: fixed;
+      top: 0;
+      right: -520px;
+      width: 500px;
+      height: 100%;
+      background: #f9f9f9;
+      padding: 20px 15px 10px 15px;
+      box-shadow: -4px 0 8px rgba(0,0,0,0.1);
+      border-top-left-radius: 12px;
+      border-bottom-left-radius: 12px;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      transition: right 0.3s ease-in-out;
+      overflow: hidden;
+      justify-content: space-between;
+    }
+    #addSlotSidebar {
+      position: fixed;
+      overflow-y: auto;
+      top: 0;
+      right: -520px;
+      width: 500px;
+      height: 100%;
+      background: #f9f9f9;
+      padding: 20px 15px 10px 15px;
+      box-shadow: -4px 0 8px rgba(0,0,0,0.1);
+      border-top-left-radius: 12px;
+      border-bottom-left-radius: 12px;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      transition: right 0.3s ease-in-out;
+      overflow: hidden;
+      justify-content: space-between;
+    }
+    body { overflow-x: hidden; }
+    #userSearchDropdown {
+      position: absolute;
+      background-color: #fff;
+      border: 1px solid #ccc;
+      max-height: 150px;
+      overflow-y: auto;
+      z-index: 11;
+      width: 90%;
+      left: 5%;
+    }
+    #userSearchDropdown li { padding: 5px; cursor: pointer; }
+    #userSearchDropdown li:hover { background-color: #f0f0f0; }
+  </style>
+  <script>
+    const host = window.location.hostname;
+    const isDev = host.includes("localhost") || host.includes("cloudshell") || host.startsWith("8080-dot");
+    const API_BASE = isDev
+      ? window.location.protocol + "//" + host
+      : "https://calendrier-ortho-531231644224.europe-west9.run.app";
+    console.log("🌍 API_BASE =", API_BASE);
+
+    // Define START_TIME globally
+    let START_TIME = 9;
+    let weekOffset = 0;
+    let userEmail = "";
+    let selectedSlots = [];
+    let isAdmin = false;
+
+    function showToast(message, duration = 4000) {
+      const toast = document.getElementById("toast");
+      toast.innerHTML = message.replace(/\n/g, "<br>");
+      toast.style.visibility = "visible";
+      toast.style.opacity = "1";
+      setTimeout(() => {
+        toast.style.opacity = "0";
+        toast.style.visibility = "hidden";
+      }, duration);
+    }
+
+    async function submitUserDetails() {
+      userEmail = document.getElementById("email").value.trim().toLowerCase();
+      if (userEmail.length < 5) {
+        showToast("Please enter a valid email.");
+        return;
+      }
+
+      try {
+        // Ask the back-end whether this address is allowed and/or admin
+        const resp = await fetch(`${API_BASE}/slots/auth/check`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: userEmail })
+        });
+        const { ok, isAdmin: adminFlag, message } = await resp.json();
+
+        if (!ok) {
+          showToast(message || "Email non autorisé.");
+          return;
+        }
+
+        /* ---- success → initialise the UI ---------------------------- */
+        isAdmin = adminFlag;      
+        sessionStorage.setItem("isAdmin", isAdmin ? "true" : "false")
+        sessionStorage.setItem("userEmail", userEmail);
+
+        document.getElementById("userForm").style.display   = "none";
+        document.getElementById("userInfo").style.display   = "block";
+        document.getElementById("userEmailDisplay").innerText = userEmail;
+        document.getElementById("userControls").style.display = "block";
+        document.getElementById("reserveButton").style.display = "inline-block";
+
+        if (isAdmin) {
+          document.getElementById("openMailSidebarButton").style.display = "inline-block";
+          document.getElementById("openAddSlotSidebarButton").style.display = "inline-block";
+        }
+        
+        loadSlots()
+      } catch (err) {
+        console.error("Erreur lors de la vérification de l'email :", err);
+        showToast("Erreur de vérification.");
+      }
+    }
+
+    window.onload = function() {
+      let storedEmail = sessionStorage.getItem("userEmail");
+      if (storedEmail) {
+        userEmail = storedEmail.toLowerCase();
+        isAdmin = sessionStorage.getItem("isAdmin") === "true";
+        document.getElementById("userForm").style.display = "none";
+        document.getElementById("userInfo").style.display = "block";
+        document.getElementById("userEmailDisplay").innerText = userEmail;
+        loadSlots();
+        document.getElementById("userControls").style.display = "block";
+        document.getElementById("reserveButton").style.display = "inline-block";
+        if (isAdmin) {
+          document.getElementById("openMailSidebarButton").style.display = "inline-block";
+          document.getElementById("openAddSlotSidebarButton").style.display = "inline-block";
+
+        }
+      }
+    };
+
+
+
+    function loadSlots() {
+      fetch(`${API_BASE}/slots?weekOffset=${weekOffset}&userEmail=${userEmail}`)
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res.json();
+      })
+      .then(data => {
+        isAdmin = data.isAdmin;
+        window.maxBookings = data.maxBookings || 6; 
+        displaySlots(data);
+      })
+      .catch(err => {
+        console.error("❌ Erreur lors du chargement des créneaux :", err);
+        document.getElementById("calendar").innerText = "Erreur lors du chargement des créneaux. Veuillez vérifier votre connexion ou réessayer plus tard.";
+      });
+    }
+
+    function displaySlots(data) {
+      console.log("📅 Données reçues du backend:", data);
+      if (!data || !Array.isArray(data.dates) || !Array.isArray(data.slots)) {
+        document.getElementById("calendar").innerHTML = "No available slots for this week.";
+        return;
+      }
+      const holidays = ["21/04/2025", "01/05/2025","08/05/2025","29/05/2025","09/06/2025","14/07/2025","15/08/2025","01/11/2025","11/11/2025","25/12/2025"]
+      let table = `<table><tr><th>Time</th>`;
+      data.dates.forEach(date => table += `<th>${date}</th>`);
+      table += `</tr>`;
+
+      // Parcours avec indice pour pouvoir accéder au créneau suivant
+      for (let i = 0; i < data.slots.length; i++) {
+        let row = data.slots[i];
+        // Fonction pour calculer l'heure de fin d'un créneau de 30 minutes
+        function getNextTime(currentTime) {
+          let [hours, minutes] = currentTime.split(":").map(Number);
+          let nextMinutes = minutes + 30;
+          if (nextMinutes >= 60) {
+            hours += 1;
+            nextMinutes = 0;
+          }
+          return `${hours.toString().padStart(2, "0")}:${nextMinutes.toString().padStart(2, "0")}`;
+        }
+        table += `<tr><td>${row.time} - ${getNextTime(row.time)}</td>`;
+
+        // Pour chaque date (colonne)
+        row.slots.forEach((count, index) => {
+          let dateValue = data.dates[index];
+          let key = `${dateValue} ${row.time}`;
+          const [day, month, year] = dateValue.split("/");
+          const slotDate = new Date(year, month - 1, day); // Month is 0-indexed
+          const slotMonth = slotDate.getMonth() + 1;
+          let slotHour = parseInt(row.time.split(":")[0]);
+          const slotTime = parseInt(row.time.split(":")[1]);
+          if (slotTime > 0) {
+            slotHour += 0.5;         
+          }
+
+          // *** Modification pour juin ***
+          // Pour les jours en juin (mois === 6), si le créneau est "09:00",
+          // on affiche une cellule désactivée indiquant que la prise de rendez-vous commence à 9:30.
+          if (slotMonth >= 6 && row.time === "09:00" && !isAdmin) {
+            table += `<td class="disabled-slot"></td>`;
+            return; // Passe au prochain créneau pour cette date
+          }
+
+          
+          let currentMaxBookings = maxBookings;
+          // Adjust maxBookings based on month
+          if (slotMonth >= 6) {
+            currentMaxBookings = 5;
+          }
+
+          // Check if it's May and the slot is 9:00 AM
+          if (slotMonth === 5 && slotHour === START_TIME) {
+            count = currentMaxBookings;
+          }
+
+          // Si c'est un jour férié
+          if (holidays.includes(dateValue)) {
+            table += `<td class="disabled-slot">Férié</td>`;
+            return;
+          }
+          if (count === null) {
+            table += `<td class="disabled-slot"></td>`;
+            return;
+          }
+
+          let userHasBooked = data.userBookings && data.userBookings.some(b => b.key === key);
+          let slotIsFull = count >= currentMaxBookings;
+          let statusText = "Libre";
+          let statusClass = "available";
+
+          if (isAdmin) { 
+            statusText = `${count}/${currentMaxBookings}`;
+            if (count === 0) statusClass = "availablead";
+            else if (count < currentMaxBookings) statusClass = "half";
+            else if (count >= currentMaxBookings) statusClass = "fullad";
+          } else if (userHasBooked) {
+            statusText = "Déjà réservé";
+            statusClass = "user-booked";
+          } else if (slotIsFull) {
+            statusText = "Complet";
+            statusClass = "full";
+          }
+
+          // Vérification pour afficher l'astérisque
+          // On s'assure que data.ophtaBookings existe et est un tableau.
+          let addAsterisk = false;
+          if (data.ophtaBookings && Array.isArray(data.ophtaBookings)) {
+            let currentOphta = data.ophtaBookings.includes(key);
+            let nextKey;
+            // Si le slot suivant existe dans data.slots, on l'utilise
+            if (i < data.slots.length - 1) {
+              nextKey = `${dateValue} ${data.slots[i + 1].time}`;
+            } else { 
+              nextKey = `${dateValue} ${getNextTime(row.time)}`;
+            }
+            let nextOphta = data.ophtaBookings.includes(nextKey);
+            if (!currentOphta) {
+              addAsterisk = true;
+            }
+  
+          }
+          if (addAsterisk) {
+            statusText += " *";
+          }
+
+          let disabled = userHasBooked || slotIsFull ? "disabled" : "";
+          table += `<td class="${statusClass}" style="text-align: center;">`;
+          if (!data.isAdmin) {
+            table += `<input type="checkbox" value="${key}" ${disabled} onclick="toggleSlotSelection('${key}')"><br>`;
+          }
+          table += `${statusText}</td>`;
+          });
+          table += `</tr>`;
+        }
+
+        table += `</table>`;
+        // Ajout de la légende en haut du calendrier
+        const legend = `<div class="legend" style="text-align: left; margin: 30px; font-size: 16px;">
+                          * : Ophta non connecté </small
+                        </div>`;
+          
+        document.getElementById("calendar").innerHTML = legend + table;
+
+      if (isAdmin) {
+        let totalReservations = 0;
+        data.slots.forEach(row => {
+          row.slots.forEach(count => {
+            if (typeof count === 'number') totalReservations += count;
+          });
+        });
+        const totalHours = (totalReservations * 0.5).toFixed(1);
+        document.getElementById("userReservationsCount").innerText =
+          `Total réservations cette semaine : ${totalReservations} (${totalHours}h)`;
+      } else {
+        let count = 0;
+        data.dates.forEach(date => {
+          data.slots.forEach(row => {
+            const key = `${date} ${row.time}`;
+            if (data.userBookings.some(b => b.key === key)) count++;
+          });
+        });
+        const totalHours = (count * 0.5).toFixed(1);
+        document.getElementById("userReservationsCount").innerText =
+          `Nombre de Créneau(x) : ${count} (~${totalHours}h)`;
+      }
+    }
+
+    function toggleSlotSelection(slot) {
+      let index = selectedSlots.indexOf(slot);
+      if (index > -1) selectedSlots.splice(index, 1);
+      else selectedSlots.push(slot);
+    }
+
+    function bookSelectedSlots() {
+      if (selectedSlots.length === 0) {
+        showToast("❗Veuillez sélectionner au moins un créneau.");
+        return;
+      }
+      const bookingRequests = selectedSlots.map(slot => {
+        const [date, time] = slot.split(" ");
+        return fetch(`${API_BASE}/slots/book`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ date, time, userEmail })
+        })
+        .then(res => res.json())
+        .then(result => ({ slot, ...result }));
+      });
+      Promise.all(bookingRequests).then(results => {
+        const successes = results.filter(r => r.success);
+        const failures = results.filter(r => !r.success);
+        let message = "";
+        if (successes.length > 0) {
+          message += `✅ Réservé(s) avec succès :\n`;
+          message += successes.map(r => `• ${r.slot}`).join("\n") + "\n";
+        }
+        if (failures.length > 0) {
+          message += `\n❌ Échec(s) de réservation :\n`;
+          message += failures.map(r => `• ${r.slot} → ${r.message}`).join("\n");
+        }
+        showToast(message.trim());
+        selectedSlots = [];
+        loadSlots();
+        const sidebar = document.getElementById("cancelSidebar");
+        const isSidebarVisible = getComputedStyle(sidebar).right === "0px";
+        if (isSidebarVisible) {
+          fetch(`${API_BASE}/user/bookings?userEmail=${userEmail}&isAdmin=${isAdmin}`)
+            .then(res => res.json())
+            .then(displayUserBookings)
+            .catch(err => console.error("Erreur lors du rechargement de la sidebar :", err));
+        }
+      }).catch(err => {
+        console.error("❌ Erreur de réservation :", err);
+        showToast("Erreur lors de la réservation.");
+      });
+    }
+
+    function prevWeek() {
+      weekOffset--;
+      loadSlots();
+    }
+
+    function nextWeek() {
+      weekOffset++;
+      loadSlots();
+    }
+
+    function openCancelSidebar() {
+      if (!userEmail) {
+        alert("Veuillez entrer votre email.");
+        return;
+      }
+
+      const adminView = isAdmin;
+
+      initCancelSidebar();
+      document.getElementById("cancelSidebar").style.right = "0";
+
+      fetch(`${API_BASE}/user/bookings?userEmail=${userEmail}&isAdmin=${adminView}`)
+        .then(res => res.json())
+        .then(bookings => {
+          if (!Array.isArray(bookings)) {
+            console.error("❌ Erreur: données invalides reçues:", bookings);
+            document.getElementById("userBookingsList").innerHTML = "Erreur de chargement.";
+            return;
+          }
+          console.log("📥 Réservations récupérées :", bookings); // 🔍 ajout utile
+          displayUserBookings(bookings);
+        });
+    }
+
+    function initCancelSidebar() {
+      const sidebar = document.getElementById("cancelSidebar");
+      const content = sidebar; // ici on utilise directement la sidebar
+      if (isAdmin) {
+        // Version admin : largeur étendue, filtres ajoutés
+        sidebar.style.width = "500px";
+        sidebar.style.right = "-520px";
+        sidebar.style.display = "flex";
+        sidebar.style.flexDirection = "column";
+        sidebar.style.justifyContent = "flex-start"; 
+        content.innerHTML = `
+          <div style="flex-grow: 0;">
+            <h3>Annuler un créneau (Admin)</h3>
+            <div id="bookingFilters" style="margin-bottom: 10px;">
+              <label for="filterDate">Date :</label>
+              <select id="filterDate" onchange="applyFilters()">
+                <option value="">Toutes</option>
+              </select>
+              <br>
+              <label for="filterEmail">Email :</label>
+              <select id="filterEmail" onchange="applyFilters()">
+                <option value="">Toutes</option>
+              </select>
+            </div>
+          </div>
+          <div style="flex-grow: 1; overflow-y: auto;" id="userBookingsList">
+            Chargement...
+          </div>
+          <div>
+            <button onclick="cancelSelectedBookings()" style="background-color: #dc3545; color: white; border: none; padding: 10px; width: 80%;">Annuler la sélection</button>
+            <button onclick="closeCancelSidebar()" style="background: transparent; border: none; color: #555; text-decoration: underline; width: 100%;margin-bottom: 40px;">Fermer</button>
+          </div>
+        `;
+      } else {
+        // Version utilisateur : on ajoute une en-tête et un pied de page simples
+        sidebar.style.width = "300px";
+        sidebar.style.right = "-320px";
+        sidebar.style.display = "flex";
+        sidebar.style.flexDirection = "column";
+        sidebar.style.justifyContent = "space-between"; // permet d'afficher le haut et le bas
+        sidebar.innerHTML = `
+          <div style="flex-grow: 0; padding-bottom: 10px;">
+            <h3>Mes réservations</h3>
+            <p style="font-size: 12px; margin-top: 5px; line-height: 1.4;">Pour annuler un créneau dans les 3 semaines suivantes, veuillez prévenir par mail à l'adresse: <a href="mailto:csm.to@tessan.io">csm.to@tessan.io</a> ou par téléphone au 01 89 71 79 67</p>
+          </div>
+          <div style="flex-grow: 1; overflow-y: auto;" id="userBookingsList">
+            Chargement...
+          </div>
+          <div style="flex-grow: 0; padding-top: 10px;">
+            <button onclick="cancelSelectedBookings()" style="background-color: #dc3545; color: white; border: none; padding: 10px; width: 80%;">Annuler la sélection</button>
+            <button onclick="closeCancelSidebar()" style="background: transparent; border: none; color: #555; text-decoration: underline; width: 100%; margin-top: 10px;margin-bottom: 40px;">Fermer</button>
+          </div>
+        `;
+      }
+    }
+
+
+
+    function closeCancelSidebar() {
+      const sidebar = document.getElementById("cancelSidebar");
+      if (isAdmin) {
+        sidebar.style.right = "-520px";
+      } else {
+        sidebar.style.right = "-320px";
+      }
+    }
+    
+    var allBookings = [];
+    function displayUserBookings(bookings) {
+      allBookings = bookings;
+      if (isAdmin) {
+        updateFilters();
+      }
+      renderBookings(bookings);
+    }
+
+    function updateFilters() {
+      // Read current selections
+      let selectedDate = document.getElementById("filterDate").value;
+      let selectedEmail = document.getElementById("filterEmail").value;
+
+      // Get the dates available for the selected email (if any) and vice versa.
+      let datesForEmail = [...new Set(allBookings.filter(b => selectedEmail === "" || b.email === selectedEmail).map(b => b.date))];
+      let emailsForDate = [...new Set(allBookings.filter(b => selectedDate === "" || b.date === selectedDate).map(b => b.email))];
+
+      // Sort the dates in ascending order (assuming format "dd/mm/yyyy")
+      datesForEmail.sort((a, b) => {
+        let partsA = a.split("/");
+        let partsB = b.split("/");
+        let dateA = new Date(partsA[2], partsA[1] - 1, partsA[0]);
+        let dateB = new Date(partsB[2], partsB[1] - 1, partsB[0]);
+        return dateA - dateB;
+      });
+      // Sort emails alphabetically
+      emailsForDate.sort();
+
+      // Update the date dropdown
+      let filterDateSelect = document.getElementById("filterDate");
+      filterDateSelect.innerHTML = '<option value="">Toutes</option>';
+      datesForEmail.forEach(date => {
+        let option = document.createElement("option");
+        option.value = date;
+        option.textContent = date;
+        filterDateSelect.appendChild(option);
+      });
+      // Retain the current selection if still available
+      if (datesForEmail.indexOf(selectedDate) !== -1) {
+        filterDateSelect.value = selectedDate;
+      } else {
+        filterDateSelect.value = "";
+      }
+
+      // Update the email dropdown
+      let filterEmailSelect = document.getElementById("filterEmail");
+      filterEmailSelect.innerHTML = '<option value="">Toutes</option>';
+      emailsForDate.forEach(email => {
+        let option = document.createElement("option");
+        option.value = email;
+        option.textContent = email;
+        filterEmailSelect.appendChild(option);
+      });
+      if (emailsForDate.indexOf(selectedEmail) !== -1) {
+        filterEmailSelect.value = selectedEmail;
+      } else {
+        filterEmailSelect.value = "";
+      }
+    }
+
+    function applyFilters() {
+      // First update the dropdown options based on current selection
+      updateFilters();
+      let selectedDate = document.getElementById("filterDate").value;
+      let selectedEmail = document.getElementById("filterEmail").value;
+
+      // Filter the global bookings list according to the selected criteria.
+      const filtered = allBookings.filter(b => {
+        const dateMatch = selectedDate === "" || b.date === selectedDate;
+        const emailMatch = selectedEmail === "" || b.email === selectedEmail;
+        return dateMatch && emailMatch;
+      });
+      renderBookings(filtered);
+    }
+
+    function renderBookings(bookings) {
+      const container = document.getElementById("userBookingsList");
+      container.innerHTML = "";
+      if (!bookings || bookings.length === 0) {
+        container.innerHTML = "Aucune réservation trouvée.";
+        return;
+      }
+      bookings.sort((a, b) => {
+        const aStr = `${a.date.split('/').reverse().join('-')}T${a.time}`;
+        const bStr = `${b.date.split('/').reverse().join('-')}T${b.time}`;
+        const aParis = new Date(new Date(aStr).toLocaleString("en-US", { timeZone: "Europe/Paris" }));
+        const bParis = new Date(new Date(bStr).toLocaleString("en-US", { timeZone: "Europe/Paris" }));
+        return aParis - bParis;
+      });
+      const isAdminView = isAdmin;
+      bookings.forEach(booking => {
+        const bookingDateTime = new Date(`${booking.date.split('/').reverse().join('-')}T${booking.time}`);
+        const now = new Date();
+        const delayInDays = Math.floor((bookingDateTime - now) / (1000 * 60 * 60 * 24));
+        const CANCEL_THRESHOLD_DAYS = 21;
+        const canCancel = isAdminView || delayInDays >= CANCEL_THRESHOLD_DAYS;
+        const label = isAdminView ? `${booking.date} ${booking.time} - ${booking.email}` : `${booking.date} ${booking.time}`;
+        const div = document.createElement("div");
+        div.innerHTML = canCancel
+          ? `<input type="checkbox" class="checkbox" value="${booking.id}"> ${label}`
+          : `<span>${label}</span>`;
+        container.appendChild(div);
+      });
+    }
+
+
+    function cancelSelectedBookings() {
+      let selected = Array.from(document.querySelectorAll("#userBookingsList input:checked")).map(cb => cb.value);
+
+      if (selected.length === 0) {
+        alert("Veuillez sélectionner au moins une réservation.");
+        return;
+      }
+
+      let selectedIds = Array.from(document.querySelectorAll("#userBookingsList input:checked"))
+      .map(checkbox => checkbox.value);
+
+      
+      fetch(`${API_BASE}/slots/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selectedIds, userEmail })
+      })
+      .then(res => res.json())
+      .then(response => {
+        showToast(response.message);
+        if (`${selected.length} réservation(s) annulée(s).`) {
+          closeCancelSidebar();
+          loadSlots();
+        } else alert("Échec de l'annulation : " + response.message)
+      });
+    }
+
+// Nouveaux codes pour le sidebar "Gestion des mails" (accessible uniquement en admin)
+function openMailSidebar() {
+      if (!isAdmin) { 
+        alert("Accès réservé aux administrateurs.");
+        return;
+      }
+      document.getElementById("mailSidebar").style.display = "flex";
+      document.getElementById("mailSidebar").style.right = "0px";
+      loadMailUsers();
+    }
+
+    function closeMailSidebar() {
+      document.getElementById("mailSidebar").style.right = "-520px";
+    }
+
+    function loadMailUsers() {
+      if (!userEmail) {
+        console.error("User email not available.");
+        // Handle the case where the user email is not available (e.g., not logged in)
+        return; 
+      }
+      fetch(`${API_BASE}/slots/mail-users?userEmail=${userEmail}`)
+      .then(res => {
+        if (!res.ok) {
+          if (res.status === 401) {
+            throw new Error("Unauthorized: You do not have permission to view mail users.");
+          } else {
+            throw new Error(`HTTP error! status: ${res.status}`);
+          }
+        }
+        return res.json();
+      })
+      .then(data => {
+        // Only proceed if data is an array
+        if (Array.isArray(data)) {
+          data.sort((a, b) => a.email.localeCompare(b.email));
+          let count = data.length;
+          let listHTML = `<div style="margin-bottom: 10px; font-weight: bold;">Total mails: ${count}</div>`;
+          listHTML += `<ul style="list-style: none; padding: 0; margin: 0;">`;
+          data.forEach(item => {
+            listHTML += `
+              <li style="padding: 5px 10px; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center;">
+                <span>${item.email}</span>
+                <button onclick="deleteMailUser('${item.id}')" style="background-color: #dc3545; color: white; border: none; padding: 4px 8px; border-radius: 3px; cursor: pointer;">Supprimer</button>
+              </li>`;
+          });
+          listHTML += "</ul>";
+          document.getElementById("mailUsersList").innerHTML = listHTML;
+        } else {
+          // Handle the case where the server returns unexpected data
+          console.error("Unexpected data format from server:", data);
+          document.getElementById("mailUsersList").innerText = "Erreur: Format de données invalide.";
+        }
+      })
+      .catch(err => {
+        console.error("Erreur lors du chargement des mails :", err);
+        document.getElementById("mailUsersList").innerText = err.message || "Erreur lors du chargement.";
+        showToast(err.message || "Erreur lors du chargement des mails."); // Also show a toast
+      });
+    }
+
+    // Ajoute un mail via l'endpoint /add-mail-user
+    function addMailUserFromSidebar() {
+      const email = document.getElementById("newMailInput").value.trim();
+      if (email.length < 5) {
+        showToast("Veuillez entrer un email valide.");
+        return;
+      }
+      fetch(`${API_BASE}/slots/add-mail-user`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email,userEmail })
+      })
+      .then(res => res.json())
+      .then(result => {
+        if (result.success) {
+          showToast("Email ajouté avec succès !");
+          document.getElementById("newMailInput").value = "";
+          loadMailUsers();
+        } else {
+          showToast("Erreur : " + result.message);
+        }
+      })
+      .catch(err => {
+        console.error("Erreur lors de l'ajout de l'email :", err);
+        showToast("Erreur lors de l'ajout de l'email.");
+      });
+    }
+
+    // Supprime un mail via l'endpoint /delete-mail-user
+    function deleteMailUser(mailId) {
+      if (!confirm("Confirmez-vous la suppression de cet email ?")) return;
+      fetch(`${API_BASE}/slots/delete-mail-user`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: mailId, userEmail})
+      })
+      .then(res => res.json())
+      .then(result => {
+        if (result.success) {
+          showToast("Email supprimé avec succès !");
+          loadMailUsers();
+        } else {
+          showToast("Erreur : " + result.message);
+        }
+      })
+      .catch(err => {
+        console.error("Erreur lors de la suppression de l'email :", err);
+        showToast("Erreur lors de la suppression de l'email.");
+      });
+    }
+
+    function openAddSlotSidebar() {
+      if (!isAdmin) {
+        alert("Accès réservé aux administrateurs.");
+        return;
+      }
+      const sidebar = document.getElementById("addSlotSidebar");
+      // Affiche-le d’abord
+      sidebar.style.display = "flex";
+      // Puis glisse-le
+      sidebar.style.right   = "0";
+      initAddSlotSidebar();
+    }
+
+    function closeAddSlotSidebar() {
+      document.getElementById("addSlotSidebar").style.right = "-520px";
+    }
+
+    function initAddSlotSidebar() {
+      const sidebar = document.getElementById("addSlotSidebar");
+      sidebar.innerHTML = `
+        <div style="flex-grow: 0;">
+          <h3>Ajouter un créneau</h3>
+          <label for="userSearch">Rechercher un utilisateur :</label>
+          <input type="text" id="userSearch" placeholder="Email de l'utilisateur" style="width: 90%; padding: 8px; margin-bottom: 10px;" autocomplete="off">
+          <ul id="userSearchDropdown" style="list-style: none; padding: 0; margin: 0; display: none;"></ul>
+          <label for="addSlotDate">Date :</label>
+          <input type="date" id="addSlotDate" style="width: 90%; padding: 8px; margin-bottom: 10px;">
+          <label for="addSlotTime">Heure :</label>
+          <input type="time" id="addSlotTime" style="width: 90%; padding: 8px; margin-bottom: 10px;">
+        </div>
+        <div style="flex-grow: 0;">
+          <button onclick="addSlot()" style="background-color: #28a745; color: white; border: none; padding: 10px; width: 80%;">Ajouter le créneau</button>
+          <button onclick="closeAddSlotSidebar()" style="background: transparent; border: none; color: #555; text-decoration: underline; width: 100%; margin-bottom: 40px;">Fermer</button>
+        </div>
+      `;
+      // Add event listener for user search
+      const userSearchInput = document.getElementById("userSearch");
+      userSearchInput.addEventListener("input", handleUserSearch);
+    }
+
+    async function handleUserSearch() {
+      const query = document.getElementById("userSearch").value.trim();
+      const dropdown = document.getElementById("userSearchDropdown");
+      dropdown.innerHTML = ""; // Clear previous results
+
+      if (query.length < 3) {
+        dropdown.style.display = "none";
+        return;
+      }
+
+      const userEmail = sessionStorage.getItem("userEmail");
+
+      if (!userEmail) {
+        showToast("User email not found. Please log in again.");
+        return;
+      }
+
+      console.log('userEmail:',userEmail)
+
+      try {
+        const response = await fetch(`${API_BASE}/slots/search-users?query=${query}&userEmail=${userEmail}`);
+        const emails = await response.json();
+
+        if (emails.length > 0) {
+          emails.forEach(email => {
+            const li = document.createElement("li");
+            li.textContent = email;
+            li.addEventListener("click", () => {
+              document.getElementById("userSearch").value = email;
+              dropdown.style.display = "none";
+            });
+            dropdown.appendChild(li);
+          });
+          dropdown.style.display = "block";
+        } else {
+          dropdown.style.display = "none";
+        }
+      } catch (error) {
+        console.error("Error searching for users:", error);
+        showToast("Error searching for users.");
+      }
+    }
+
+    async function addSlot() {
+      const mail = document.getElementById("userSearch").value.trim();
+      const date = document.getElementById("addSlotDate").value;
+      const time = document.getElementById("addSlotTime").value;
+
+      if (!mail || !date || !time) {
+        showToast("Veuillez remplir tous les champs.");
+        return;
+      }
+
+      // Format the date and time to dd/MM/yyyy HH:mm
+      const formattedDate = new Date(date).toLocaleDateString('fr-FR');
+      const formattedTime = time;
+
+      try {
+        const response = await fetch(`${API_BASE}/slots/add-slot`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userEmail, date: formattedDate, time: formattedTime, mail: mail })
+        });
+
+        const result = await response.json();
+        if (result.success) {
+          showToast("Créneau ajouté avec succès !");
+          loadSlots();
+        } else {
+          showToast("Erreur : " + result.message);
+        }
+      } catch (error) {
+        console.error("Error adding slot:", error);
+        showToast("Erreur lors de l'ajout du créneau.");
+      }
+    }
+
+
+
+    function logout() {
+      sessionStorage.removeItem("userEmail");
+      location.reload(); // Recharge la page pour réinitialiser l'état
+    }
+
+  </script>
+</head>
+<body>
+  <h1>Calendrier Orthoptiste</h1>
+  <div id="userForm" class="form-container">
+    <label>Email: <input type="email" id="email" autocomplete="off"></label>
+    <button onclick="submitUserDetails()" style="
+      background-color: #007BFF;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    ">
+      Entrer
+    </button>
+  </div>
+
+  <!-- Conteneur des boutons visibles uniquement après saisie d'un email -->
+  <div id="userControls">
+    <div>
+      <span class="nav" onclick="prevWeek()">⬅️ Semaine Précédente</span>
+      <span class="nav" onclick="nextWeek()">Semaine Prochaine ➡️</span>
+    </div>
+    <button onclick="openCancelSidebar()" style="position: fixed; top: 50px; right: 10px; background-color: red; color: white; border: none; padding: 8px 12px; cursor: pointer; border-radius: 5px; font-weight: bold;">
+      Annuler un créneau
+    </button>
+    <!-- Bouton de gestion des mails visible uniquement pour l'admin -->
+    <button id="openMailSidebarButton" onclick="openMailSidebar()" style="display:none; position: fixed; top: 90px; right: 10px; background-color: #007BFF; color: white; border: none; padding: 8px 12px; cursor: pointer; border-radius: 5px; font-weight: bold;">
+      Gestion des mails
+    </button>
+    <!-- Bouton d'ajout de créneau (admin uniquement) -->
+    <button
+      id="openAddSlotSidebarButton" onclick="openAddSlotSidebar()" style="display:none; position: fixed; top: 130px; right: 10px; background-color: #28a745; color: white; border: none; padding: 8px 12px; cursor: pointer; border-radius: 5px; font-weight: bold;">
+      Ajouter un créneau
+    </button>
+    <div style="position: fixed; bottom: 10px; left: 10px;">
+      <button onclick="logout()" style="padding: 8px 12px; color: white; background-color: transparent; border: none; border-radius: 5px; cursor: pointer;">
+        Déconnexion
+      </button>
+    </div>
+  </div>
+
+  <!-- Sidebar pour annuler des créneaux (déjà existant) -->
+  <div id="cancelSidebar" style="position: fixed; top: 0; right: -320px; width: 300px; height: 100%; background: #f9f9f9; padding: 20px 15px 10px 15px; box-shadow: -4px 0 8px rgba(0,0,0,0.1); border-top-left-radius: 12px; border-bottom-left-radius: 12px; z-index: 10; display: flex; flex-direction: column; transition: right 0.3s ease-in-out; overflow: hidden; justify-content: space-between;">
+    <div style="flex-grow: 1; overflow-y: auto;" id="userBookingsList">
+      Chargement...
+    </div>
+  </div>
+
+  <!-- Nouveau sidebar "Gestion des mails" -->
+  <div id="mailSidebar" style="position: fixed; top: 0; right: -520px; width: 500px; height: 100%; background: #f9f9f9; padding: 20px 15px 10px 15px; box-shadow: -4px 0 8px rgba(0,0,0,0.1); border-top-left-radius: 12px; border-bottom-left-radius: 12px; z-index: 10; display: none; flex-direction: column; transition: right 0.3s ease-in-out; overflow-y: auto;">
+    <div>
+      <h3>Gestion des mails</h3>
+      <!-- Zone d'ajout d'un email -->
+      <input type="email" id="newMailInput" placeholder="Email à ajouter" style="padding:8px; width:80%;" autocomplete="off"/>
+      <button onclick="addMailUserFromSidebar()" style="padding:8px 12px; margin-top:10px;">Ajouter</button>
+    </div>
+    <hr>
+    <!-- Liste des mails enregistrés -->
+    <div id="mailUsersList">Chargement...</div>
+    <button onclick="closeMailSidebar()" style="background: transparent; border: none; color: #555; text-decoration: underline; width: 100%;margin-bottom: 40px">Fermer</button>
+  </div>
+
+  <!-- Sidebar pour ajouter des créneaux -->
+  <div id="addSlotSidebar"
+  style="position: fixed;
+        top: 0;
+        right: -520px;
+        width: 500px;
+        height: 100%;
+        background: #f9f9f9;
+        padding: 20px 15px 10px 15px;
+        box-shadow: -4px 0 8px rgba(0,0,0,0.1);
+        border-top-left-radius: 12px;
+        border-bottom-left-radius: 12px;
+        z-index: 10;
+        display: none;
+        flex-direction: column;
+        transition: right 0.3s ease-in-out;
+        overflow-y: auto;
+        justify-content: space-between;">
+  <!-- Contenu injecté dynamiquement par initAddSlotSidebar() -->
+  </div>
+
+
+
+  <div id="toast" style="
+    visibility: hidden;
+    min-width: 250px;
+    background-color: #323232;
+    color: #fff;
+    text-align: left;
+    border-radius: 8px;
+    padding: 16px;
+    position: fixed;
+    z-index: 9999;
+    right: 30px;
+    bottom: 30px;
+    font-size: 14px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    transition: visibility 0s, opacity 0.5s ease-in-out;
+    opacity: 0;
+  "></div>
+
+
+ 
+  <div id="userInfo" style="display: none;">
+    <p id="userEmailDisplay">Email: Chargement...</p>
+    <p id="userReservationsCount">Nombre de Crénau(x) : 0</p>
+
+  </div>
+  <div id="calendar">Veuillez saisir votre email pour visualiser.</div>
+  <div>
+    <button id="reserveButton" onclick="bookSelectedSlots()" style="
+    position : fixed;
+    bottom: 70px;
+    right: 10px;
+    padding: 10px 16px;
+    background-color: #28a745;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-weight: bold;
+    cursor: pointer;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    margin-top: 10px;
+  ">
+    Sauvegarder
+  </button>
+  </div>
+</body>
+</html>
+
